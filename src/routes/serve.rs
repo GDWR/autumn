@@ -10,6 +10,7 @@ use serde::Deserialize;
 use std::cmp;
 use std::io::Cursor;
 use std::path::PathBuf;
+use log::error;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 
@@ -31,7 +32,7 @@ pub fn try_resize(buf: Vec<u8>, width: u32, height: u32) -> Result<Vec<u8>, Imag
         // resize_exact is about 2.5x slower,
         //  thumb approximation doesn't have terrible quality so it's fine to stick with
         //.resize_exact(width as u32, height as u32, image::imageops::FilterType::Gaussian)
-        .thumbnail_exact(width as u32, height as u32);
+        .thumbnail_exact(width, height);
 
     match config.serve {
         ServeConfig::PNG => {
@@ -83,62 +84,71 @@ pub async fn fetch_file(
             .map_err(|_| Error::IOError)?;
     }
 
-    if let Some(parameters) = resize {
-        if let Metadata::Image { width, height } = metadata {
-            let shortest_length = cmp::min(width, height);
-            let (target_width, target_height) = match (
-                parameters.size,
-                parameters.max_side,
-                parameters.width,
-                parameters.height,
-            ) {
-                (Some(size), _, _, _) => {
-                    let smallest_size = cmp::min(size, shortest_length);
-                    (smallest_size, smallest_size)
-                }
-                (_, Some(size), _, _) => {
-                    if shortest_length == width {
-                        let h = cmp::min(height, size);
-                        ((width as f32 * (h as f32 / height as f32)) as isize, h)
-                    } else {
-                        let w = cmp::min(width, size);
-                        (w, (height as f32 * (w as f32 / width as f32)) as isize)
-                    }
-                }
-                (_, _, Some(w), Some(h)) => (cmp::min(width, w), cmp::min(height, h)),
-                (_, _, Some(w), _) => {
-                    let w = cmp::min(width, w);
-                    (w, (w as f32 * (height as f32 / width as f32)) as isize)
-                }
-                (_, _, _, Some(h)) => {
-                    let h = cmp::min(height, h);
-                    ((h as f32 * (width as f32 / height as f32)) as isize, h)
-                }
-                _ => return Ok((contents, None)),
-            };
+    // If not an image, we don't perform any further alterations
+    let (width, height) = match metadata {
+        Metadata::Image { width: w, height: h } => (w, h),
+        _ => return Ok((contents, None)),
+    };
 
-            // There should be a way to do this zero-copy, but I can't be asked to figure it out right now.
-            let cloned = contents.clone();
-            if let Ok(Ok(bytes)) = actix_web::web::block(move || {
-                try_resize(cloned, target_width as u32, target_height as u32)
-            })
-            .await
-            {
-                return Ok((
-                    bytes,
-                    Some(
-                        match config.serve {
-                            ServeConfig::PNG => "image/png",
-                            ServeConfig::WEBP { .. } => "image/webp",
-                        }
-                        .to_string(),
-                    ),
-                ));
+
+    if let Some(params) = resize {
+        let (new_width, new_height) = match params {
+
+            // ?size=...
+            Resize { size: Some(requested_size), .. } => {
+                let smallest_size = cmp::min(requested_size, cmp::min(width, height));
+                (smallest_size, smallest_size)
+            }
+
+            // ?max_side=...
+            Resize { max_side: Some(requested_max_side), .. } => {
+                if width <= height {
+                    let h = cmp::min(height, requested_max_side);
+                    ((width as f32 * (h as f32 / height as f32)) as isize, h)
+                } else {
+                    let w = cmp::min(width, requested_max_side);
+                    (w, (height as f32 * (w as f32 / width as f32)) as isize)
+                }
+            }
+
+            // ?width=...&height=...
+            Resize { width: Some(requested_width), height: Some(requested_height), .. } => {
+                (cmp::min(width, requested_width), cmp::min(height, requested_height))
+            }
+
+            // ?width=...
+            Resize { width: Some(requested_width), .. } => {
+                let w = cmp::min(width, requested_width);
+                (w, (w as f32 * (height as f32 / width as f32)) as isize)
+            }
+
+            // ?height=...
+            Resize { height: Some(requested_height), .. } => {
+                let h = cmp::min(height, requested_height);
+                ((h as f32 * (width as f32 / height as f32)) as isize, h)
+            }
+
+            _ => return Ok((contents, None)),
+        };
+
+
+        let resize_task = actix_web::web::block(
+            move || try_resize(contents, new_width as u32, new_height as u32));
+
+        match resize_task.await.map_err(|_| Error::BlockingError)? {
+            Ok(resized_content) => Ok((resized_content, Some(match config.serve {
+                ServeConfig::PNG => "image/png",
+                ServeConfig::WEBP { .. } => "image/webp",
+            }.to_string()))),
+            Err(e) => {
+                error!("Failed to resize image. id={id} params={params:?} e={e}");
+                Err(Error::IOError)
             }
         }
+    } else {
+        // No alterations requested via query params
+        Ok((contents, None))
     }
-
-    Ok((contents, None))
 }
 
 pub async fn get(req: HttpRequest, resize: Query<Resize>) -> Result<HttpResponse, Error> {
